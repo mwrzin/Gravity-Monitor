@@ -13,6 +13,7 @@ pub mod cpu;
 pub mod ram;
 pub mod gpu;
 pub mod carbon;
+pub mod permissions;
 
 /// Representação serializável da base de dados final produzida no momento da Interrupção pelo usuário.
 #[derive(Serialize)]
@@ -51,7 +52,23 @@ pub struct GravityTracker {
 impl GravityTracker {
     /// O método Construtor invisível mapeado para `gravity_monitor.GravityTracker()` no frontend.
     #[new]
+    #[cfg(target_os = "linux")]
     pub fn new() -> Self {
+        Self {
+            sensor: cpu::CpuSensor::new(),
+            ram_sensor: ram::RamSensor::new(),
+            gpu_sensor: gpu::GpuSensor::new(),
+            start_time: None,
+            total_joules_accumulated: Arc::new(Mutex::new(0.0)),
+            is_running: Arc::new(AtomicBool::new(false)),
+            checkpoints: Vec::new(),
+        }
+    }
+
+    #[new]
+    #[cfg(target_os = "windows")]
+    pub fn new() -> Self {
+        permissions::SystemCapabilities::check_windows_drivers();
         Self {
             sensor: cpu::CpuSensor::new(),
             ram_sensor: ram::RamSensor::new(),
@@ -69,6 +86,7 @@ impl GravityTracker {
     }
 
     /// O Famoso Inicializador. Destrava e delega toda a computação à Threading Limpa do Sistema Operacional puro.
+    #[cfg(target_os = "linux")]
     pub fn start(&mut self) -> PyResult<()> {
         if self.is_running.load(Ordering::SeqCst) {
             return Err(PyRuntimeError::new_err("O monitoramento já está em andamento."));
@@ -87,7 +105,11 @@ impl GravityTracker {
         let acc_clone = self.total_joules_accumulated.clone();
 
         // Extrai a Medição T0 Pura fora da thread (Limpando o risco absurdo do "Falso Pico Delta" no milissegundo inicial)
-        let mut last_cpu = cpu_sensor_clone.read_joules().unwrap_or(0.0);
+        let last_cpu = match cpu_sensor_clone.read_joules() {
+            Ok(v) => v,
+            Err(e) => return Err(PyRuntimeError::new_err(e)),
+        };
+        let mut last_cpu_mut = last_cpu;
         let mut last_ram = ram_sensor_clone.read_joules().unwrap_or(0.0);
         let mut last_gpu = gpu_sensor_clone.read_joules().unwrap_or(0.0);
 
@@ -97,12 +119,12 @@ impl GravityTracker {
                 // Ciclo Perfeito de 100ms exigido à risca para garantir precisão atômica dos Deltas
                 thread::sleep(Duration::from_millis(100));
 
-                let current_cpu = cpu_sensor_clone.read_joules().unwrap_or(last_cpu);
+                let current_cpu = cpu_sensor_clone.read_joules().unwrap_or(last_cpu_mut);
                 let current_ram = ram_sensor_clone.read_joules().unwrap_or(last_ram);
                 let current_gpu = gpu_sensor_clone.read_joules().unwrap_or(last_gpu);
 
                 // Deduzir Carga Integral Gasta! (Quantos Joules o PC sugou fisicamente nesses míseros 100ms de vida?)
-                let mut delta_cpu = current_cpu - last_cpu;
+                let mut delta_cpu = current_cpu - last_cpu_mut;
                 let mut delta_ram = current_ram - last_ram;
                 let mut delta_gpu = current_gpu - last_gpu;
                 
@@ -111,7 +133,7 @@ impl GravityTracker {
                 if delta_ram < 0.0 { delta_ram = 0.0; }
                 if delta_gpu < 0.0 { delta_gpu = 0.0; }
 
-                last_cpu = current_cpu;
+                last_cpu_mut = current_cpu;
                 last_ram = current_ram;
                 last_gpu = current_gpu;
 
@@ -124,6 +146,12 @@ impl GravityTracker {
         println!("Monitoramento iniciado em background (100ms amostragem)...");
         Ok(())
     }
+
+    #[cfg(target_os = "windows")]
+    pub fn start(&mut self) -> PyResult<()> {
+        return Err(PyRuntimeError::new_err(permissions::SystemCapabilities::get_elevation_message()));
+    }
+
 
     /// O Termo de Segurança de Finalização.
     pub fn stop(&mut self) -> PyResult<()> {

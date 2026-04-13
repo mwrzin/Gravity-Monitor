@@ -1,6 +1,8 @@
 use std::fs;
+use std::io;
 use sysinfo::System;
 use std::time::SystemTime;
+use crate::permissions::SystemCapabilities;
 
 /// Estrutura responsável por extrair ou simular matematicamente o consumo energético das Memórias (DRAM).
 #[derive(Clone)]
@@ -12,6 +14,7 @@ pub struct RamSensor {
 
 impl RamSensor {
     /// Inicializa a telemetria da memória verificando o suporte no kernel antes da pre-alocação.
+    #[cfg(target_os = "linux")]
     pub fn new() -> Self {
         // Nas plataformas Intel modernas, a DRAM (Memória) é rastreada sob o canal sub-RAPL :0:0.
         let path = String::from("/sys/class/powercap/intel-rapl:0:0/energy_uj");
@@ -30,7 +33,19 @@ impl RamSensor {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn new() -> Self {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        Self {
+            path: String::new(),
+            has_rapl: false,
+            total_memory_bytes: sys.total_memory(),
+        }
+    }
+
     /// Processa a leitura, priorizando sempre a interface elétrica real antes da simulação.
+    #[cfg(target_os = "linux")]
     pub fn read_joules(&self) -> Result<f64, String> {
         if self.has_rapl {
             // Caminho Rápido: O hardware provê o consumo exato da DRAM acumulado em MicroJoules.
@@ -39,9 +54,13 @@ impl RamSensor {
                     let microjoules: f64 = content.trim().parse().unwrap_or(0.0);
                     Ok(microjoules / 1_000_000.0) // Redução direta do offset pra Joule nativo
                 }
-                Err(_) => {
-                    // Fallback reativo: Se no meio do processo a permissão sumiu, passamos para a estimativa térmica.
-                    self.estimate_joules()
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::PermissionDenied {
+                        Err(SystemCapabilities::get_elevation_message())
+                    } else {
+                        // Fallback reativo: permissão correta mas lida falhou na via, usa estimativa.
+                        self.estimate_joules()
+                    }
                 }
             }
         } else {
@@ -49,6 +68,15 @@ impl RamSensor {
             self.estimate_joules()
         }
     }
+
+    #[cfg(target_os = "windows")]
+    pub fn read_joules(&self) -> Result<f64, String> {
+        // No Windows, por enquanto só é liberado estimativa se MSR ainda falhar:
+        // Porém, se for exigido ler MSR no futuro, vamos retornar o SystemCapabilities
+        // No momento a versão fallback já ajuda o Monitor enquanto não temos WinRing0.
+        self.estimate_joules()
+    }
+
     
     /// Função de Fallback que aplica Física para calcular gasto baseado em volume fixo.
     fn estimate_joules(&self) -> Result<f64, String> {

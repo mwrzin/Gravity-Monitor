@@ -1,1 +1,20 @@
-/target
+# Rust
+target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Binários e extensões C
+*.so
+*.whl
+
+# Variaveis de ambiente virtuais
+venv/
+env/
+.env/
+
+# Resultados locais gerados
+resultado.json
