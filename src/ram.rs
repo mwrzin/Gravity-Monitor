@@ -7,6 +7,7 @@ use crate::permissions::SystemCapabilities;
 /// Estrutura responsável por extrair ou simular matematicamente o consumo energético das Memórias (DRAM).
 #[derive(Clone)]
 pub struct RamSensor {
+    pub manual_override_capacity: Option<f64>,
     pub path: String,               // Localização do RAPL para DRAM, se suportado fisicamente.
     pub has_rapl: bool,             // Flag estática que indica se a placa mãe vazou o sensor via ACPI.
     pub total_memory_bytes: u64,    // Buffer imutável guardando o total da RAM em bytes via sysinfo.
@@ -15,7 +16,7 @@ pub struct RamSensor {
 impl RamSensor {
     /// Inicializa a telemetria da memória verificando o suporte no kernel antes da pre-alocação.
     #[cfg(target_os = "linux")]
-    pub fn new() -> Self {
+    pub fn new(manual_override_capacity: Option<f64>) -> Self {
         // Nas plataformas Intel modernas, a DRAM (Memória) é rastreada sob o canal sub-RAPL :0:0.
         let path = String::from("/sys/class/powercap/intel-rapl:0:0/energy_uj");
         
@@ -27,6 +28,7 @@ impl RamSensor {
         sys.refresh_memory(); // Atualiza ponteiros de status de RAM
         
         Self {
+            manual_override_capacity,
             path,
             has_rapl,
             total_memory_bytes: sys.total_memory(), // Extrai o físico fixado pra usar em simulações.
@@ -34,10 +36,11 @@ impl RamSensor {
     }
 
     #[cfg(target_os = "windows")]
-    pub fn new() -> Self {
+    pub fn new(manual_override_capacity: Option<f64>) -> Self {
         let mut sys = System::new();
         sys.refresh_memory();
         Self {
+            manual_override_capacity,
             path: String::new(),
             has_rapl: false,
             total_memory_bytes: sys.total_memory(),
@@ -47,6 +50,10 @@ impl RamSensor {
     /// Processa a leitura, priorizando sempre a interface elétrica real antes da simulação.
     #[cfg(target_os = "linux")]
     pub fn read_joules(&self) -> Result<f64, String> {
+        if self.manual_override_capacity.is_some() {
+            return self.estimate_joules();
+        }
+
         if self.has_rapl {
             // Caminho Rápido: O hardware provê o consumo exato da DRAM acumulado em MicroJoules.
             match fs::read_to_string(&self.path) {
@@ -81,7 +88,7 @@ impl RamSensor {
     /// Função de Fallback que aplica Física para calcular gasto baseado em volume fixo.
     fn estimate_joules(&self) -> Result<f64, String> {
         // Converte a quantidade de bytes da RAM pra Gigabytes
-        let gb = self.total_memory_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+        let gb = self.manual_override_capacity.unwrap_or(self.total_memory_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
         
         // Atribuição de tolerância base de hardware: Assume em média ~0.375 Watts passivos gastos POR Gigabyte DDR4!
         let estimated_power_watts = gb * 0.375;

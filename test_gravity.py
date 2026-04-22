@@ -5,16 +5,27 @@ import gravity_monitor
 BRAZIL_INTENSITY = 82.0
 
 def main():
+    import gravity_cli
     print("--- Inicializando Gravity Monitor via Python ---")
     
-    # Instancia o subobjeto exportado puro do Rust via C-Bindings FFI (PyO3). Nenhum lixo de memória sujará o root script!
+    # 1. Executa o Pre-Flight Interativo
+    conf = gravity_cli.configure()
+    
+    # 2. Instancia o subobjeto exportado puro do Rust via C-Bindings FFI (PyO3). Nenhum lixo de memória sujará o root script!
     tracker = gravity_monitor.GravityTracker()
+    
+    # 3. Injecao de override dinâmico se o usuario optou por forçar os MSRs bloqueados
+    if conf:
+        tracker.cpu_tdp = conf.get("cpu_tdp")
+        tracker.gpu_wattage = conf.get("gpu_wattage")
+        tracker.ram_capacity = conf.get("ram_capacity")
+        print("\n[+] Override ativado. Os próximos passos rodarão no modo de simulação Anti-Crash!")
     
     # Analisa na mosca as permissões para coleta Massiva de Hardware no nó da Placa de Vídeo
     if tracker.has_gpu():
-        print("[+] GPU NVIDIA detectada! Adicionando NVML hardware aos cálculos de Joules cumulativos.")
+        print("\n[+] GPU NVIDIA detectada! Adicionando NVML hardware aos cálculos de Joules cumulativos.")
     else:
-        print("[-] Nenhuma GPU suportada detectada via NVML (Fallback para 0.0W GPU).")
+        print("\n[-] Nenhuma GPU suportada detectada via NVML (Fallback para 0.0W/Estimação).")
     
     try:
         # Tenta iniciar a Thread paralela atômica e inviolável (Quebra com RuntimeError limpo caso rode sem 'sudo' na raiz linux)

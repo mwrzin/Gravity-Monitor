@@ -10,15 +10,29 @@ Desenvolvido com excelência na **Universidade Federal do Pará (UFPA)**, com fo
 - **Profiling por Escopo Analítico:** Uso inovador de *Context Managers* e anotações via Tags que medem o Joules e Custo em tempo real para blocos localizados (ex: `limpeza_de_dados`, `treinamento_pesado`).
 - **Equivalência Termodinâmica Regional:** Um sistema revolucionário de conversão C++ de Joules brutos transistores em equivalências palpáveis (ex: O impacto energético local equiparado e traduzido para elevação das *Marés de Salinópolis* em dias quentes no Pará).
 
-## Instalação e Compilação C
+## Pré-Requisitos e Compatibilidade
 
-Esse projeto utiliza Python estrito com módulos FFI (Foreign Function Interfaces) do sistema construídos em Rust. Para construí-lo, o pacote universal **maturin** deve ser usado.
+A telemetria de Hardware puro é uma ciência restrita em segurança arquitetural. Siga os requisitos abaixo dependendo do seu ecossistema alvo:
+
+### 🐧 Linux (Recomendado para Datacenters AI)
+- **Privilégios:** O monitoramento nativo limpo exige a leitura dos Model-Specific Registers (MSRs) do chip e do sensor RAPL de fábrica ou o uso do perf_event_paranoid. É **obrigatório** rodar o seu treinamento usando `$ sudo python script.py`.
+- **Dependências de Build:** Rust Toolchain instalada (`cargo`), Python 3.12+, GCC/Build-essentials limpos instalados em sua distribuição.
+
+### 🪟 Windows (Recomendado para Estações Locais)
+- **Privilégios:** Como a Microsoft bloqueia incondicionalmente a manipulação de MSRs por ferramentas externas via kernel Ring-0 sem drivers verificados/assinados, a CPU e a RAM operam em **Simulação Heurística (Fallback Anti-Crash)** via detecção atômica. O Gravity Monitor não quebra no Windows.
+- **Placas de Vídeo (NVML):** Telemetria em 100% de precisão para GPUs Nvidia utilizando a injeção nativa de `nvml.dll`.
+- **Pre-Flight Configuration:** No Windows, recomenda-se iniciar o monitor setando manualmente o TDP máximo teórico da peça por meio do nosso terminal interativo TUI (veja abaixo).
+
+## Como Instalar e Compilar (C-Bindings)
+
+Esse projeto utiliza Python estrito atrelado a módulos de Foreign Function Interface (FFI) compilados isoladamente pela base em Rust. Instancie assim:
 
 ```bash
-# 1. Instale o maturim no seu ambiente python
-pip install maturin
+# 1. Ative seu Python Virtual Environment (venv)
+# 2. Instale as pontes de build e a dependência nativa no PyPi
+pip install maturin sysinfo
 
-# 2. Compile e injete o pacote no ambiente virtual ativamente (Release Mode / Otimizado)
+# 3. Compile e construa os binários estáticos injetando magicamente na sua Venv (Modo Otimizado)
 maturin develop --release
 ```
 

@@ -6,6 +6,7 @@ use std::time::Instant;
 /// Mantém as sessões da API C da NVML presas e protegidas em blocos Thread-Safe (Arc/Mutex).
 #[derive(Clone)]
 pub struct GpuSensor {
+    pub manual_override_power: Option<f64>,
     pub has_gpu: bool,
     nvml: Option<Arc<Mutex<Nvml>>>,               // Instância subjacente da NVML. O Option lida com a falta desta silenciosamente.
     last_time: Arc<Mutex<Instant>>,               // Auxiliar de controle de tempo delta para Integração de Potência Preditiva
@@ -14,13 +15,14 @@ pub struct GpuSensor {
 
 impl GpuSensor {
     /// Tenta buscar silenciosamente os binários da driver NVIDIA local e estabelecer a pipeline.
-    pub fn new() -> Self {
+    pub fn new(manual_override_power: Option<f64>) -> Self {
         // Nvml::init varre as dependências nativas (libnvidia-ml.so no C-Level).
         match Nvml::init() {
             Ok(nvml) => {
                 // Confirma operatividade testando um PING primitivo no barramento PCI da Placa 0.
                 match nvml.device_by_index(0) {
                     Ok(_) => Self {
+                        manual_override_power,
                         has_gpu: true,
                         nvml: Some(Arc::new(Mutex::new(nvml))),
                         last_time: Arc::new(Mutex::new(Instant::now())),
@@ -28,6 +30,7 @@ impl GpuSensor {
                     },
                     Err(_) => Self {
                         // Se o bind passou mas falhou a leitura por PCI (ex: erro no container/docker de driver), cai forasteiro.
+                        manual_override_power,
                         has_gpu: false,
                         nvml: None,
                         last_time: Arc::new(Mutex::new(Instant::now())),
@@ -37,6 +40,7 @@ impl GpuSensor {
             }
             Err(_) => Self {
                 // Caso seja hardware Intel, macOS, ou drivers da Nvidia ausentes, ele instacia uma Placa de Vídeo virtual morta sem causar bugs de Python.
+                manual_override_power,
                 has_gpu: false,
                 nvml: None,
                 last_time: Arc::new(Mutex::new(Instant::now())),
@@ -47,6 +51,17 @@ impl GpuSensor {
 
     /// Lê a potência, lidando ativamente com os chips Datacenter (mJ brutos) e chips Domésticos (mW instantâneos transitorios).
     pub fn read_joules(&self) -> Result<f64, String> {
+        // Se houver substituição manual, simula um workload agressivo na GPU
+        if let Some(override_watts) = self.manual_override_power {
+            let mut last = self.last_time.lock().unwrap();
+            let mut acc = self.accumulated_joules.lock().unwrap();
+            let now = Instant::now();
+            let delta_s = now.duration_since(*last).as_secs_f64();
+            *last = now;
+            *acc += override_watts * delta_s;
+            return Ok(*acc);
+        }
+
         if !self.has_gpu {
             // Silencia a telemetria caso seja rodado num hardware desprovido de NVIDIA. O sistema continuará focado em CPU/RAM perfeitamente.
             return Ok(0.0);

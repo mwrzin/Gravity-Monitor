@@ -22,6 +22,7 @@ pub struct ExportData {
     pub watts: f64,           // Demanda energética absoluta dividida pelao tempo ativo
     pub total_joules: f64,    // Unidade universal capturada dos transistores físicos
     pub co2_emissions: f64,   // Conversão termodinâmica processada em massa de carbono
+    pub estimated_fallback: bool, // Flag atestando se a energia veio por predição termodinâmica.
 }
 
 /// A classe Raiz exportada para o Python. É decorada com [pyclass] o que diz ao PyO3 
@@ -46,38 +47,44 @@ pub struct GravityTracker {
     
     // Vetor que age como Memória de Longo Prazo do "Python Context Manager". Armazena os blocos com sufixos _start ou _end!
     pub checkpoints: Vec<(String, f64)>,
+
+    // Flag de saúde informando se o monitoramento precisou cair para o Anti-Crash Guarantee (Estimativa por CPU load)
+    pub estimated_fallback: Arc<AtomicBool>,
 }
 
 #[pymethods]
 impl GravityTracker {
-    /// O método Construtor invisível mapeado para `gravity_monitor.GravityTracker()` no frontend.
+    /// O método Construtor único (Cross-platform) mapeado para `gravity_monitor.GravityTracker()` no frontend.
     #[new]
-    #[cfg(target_os = "linux")]
     pub fn new() -> Self {
+        #[cfg(target_os = "windows")]
+        permissions::SystemCapabilities::check_windows_drivers();
+
         Self {
-            sensor: cpu::CpuSensor::new(),
-            ram_sensor: ram::RamSensor::new(),
-            gpu_sensor: gpu::GpuSensor::new(),
+            sensor: cpu::CpuSensor::new(None),
+            ram_sensor: ram::RamSensor::new(None),
+            gpu_sensor: gpu::GpuSensor::new(None),
             start_time: None,
             total_joules_accumulated: Arc::new(Mutex::new(0.0)),
             is_running: Arc::new(AtomicBool::new(false)),
             checkpoints: Vec::new(),
+            estimated_fallback: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    #[new]
-    #[cfg(target_os = "windows")]
-    pub fn new() -> Self {
-        permissions::SystemCapabilities::check_windows_drivers();
-        Self {
-            sensor: cpu::CpuSensor::new(),
-            ram_sensor: ram::RamSensor::new(),
-            gpu_sensor: gpu::GpuSensor::new(),
-            start_time: None,
-            total_joules_accumulated: Arc::new(Mutex::new(0.0)),
-            is_running: Arc::new(AtomicBool::new(false)),
-            checkpoints: Vec::new(),
-        }
+    #[setter]
+    pub fn set_cpu_tdp(&mut self, value: Option<f64>) {
+        self.sensor.manual_override_tdp = value;
+    }
+
+    #[setter]
+    pub fn set_gpu_wattage(&mut self, value: Option<f64>) {
+        self.gpu_sensor.manual_override_power = value;
+    }
+
+    #[setter]
+    pub fn set_ram_capacity(&mut self, value: Option<f64>) {
+        self.ram_sensor.manual_override_capacity = value;
     }
 
     /// Devolve ao ambiente externo de forma assíncrona se a varredura primária conseguiu dar 'Bind' em GPUs locais.
@@ -85,8 +92,7 @@ impl GravityTracker {
         Ok(self.gpu_sensor.has_gpu)
     }
 
-    /// O Famoso Inicializador. Destrava e delega toda a computação à Threading Limpa do Sistema Operacional puro.
-    #[cfg(target_os = "linux")]
+    /// O Famoso Inicializador. Destrava e delega toda a computação à Threading Limpa do Sistema Operacional puro (Agora Cross-Platform).
     pub fn start(&mut self) -> PyResult<()> {
         if self.is_running.load(Ordering::SeqCst) {
             return Err(PyRuntimeError::new_err("O monitoramento já está em andamento."));
@@ -103,11 +109,21 @@ impl GravityTracker {
         let gpu_sensor_clone = self.gpu_sensor.clone();
         let is_running_clone = self.is_running.clone();
         let acc_clone = self.total_joules_accumulated.clone();
+        let fallback_clone = self.estimated_fallback.clone();
 
-        // Extrai a Medição T0 Pura fora da thread (Limpando o risco absurdo do "Falso Pico Delta" no milissegundo inicial)
+        // Extrai a Medição T0 Pura fora da thread. Aborda o "Anti-Crash Guarantee" do treinamento.
         let last_cpu = match cpu_sensor_clone.read_joules() {
             Ok(v) => v,
-            Err(e) => return Err(PyRuntimeError::new_err(e)),
+            Err(e) => {
+                Python::with_gil(|py| {
+                    if let Ok(warnings) = py.import_bound("warnings") {
+                        let msg = format!("Falha de Hardware - Ativando Fallback Anti-Crash.\nMotivo: {}", e);
+                        let _ = warnings.call_method1("warn", (msg, py.get_type_bound::<pyo3::exceptions::PyRuntimeWarning>()));
+                    }
+                });
+                fallback_clone.store(true, Ordering::SeqCst);
+                0.0
+            }
         };
         let mut last_cpu_mut = last_cpu;
         let mut last_ram = ram_sensor_clone.read_joules().unwrap_or(0.0);
@@ -145,11 +161,6 @@ impl GravityTracker {
 
         println!("Monitoramento iniciado em background (100ms amostragem)...");
         Ok(())
-    }
-
-    #[cfg(target_os = "windows")]
-    pub fn start(&mut self) -> PyResult<()> {
-        return Err(PyRuntimeError::new_err(permissions::SystemCapabilities::get_elevation_message()));
     }
 
 
@@ -263,6 +274,7 @@ impl GravityTracker {
                     watts,
                     total_joules: acc,
                     co2_emissions: co2,
+                    estimated_fallback: self.estimated_fallback.load(Ordering::SeqCst),
                 };
 
                 let file = File::create(filename).map_err(|e| PyRuntimeError::new_err(format!("Erro ao criar arquivo: {}", e)))?;
