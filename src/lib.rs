@@ -1,62 +1,87 @@
-// src/lib.rs
-use pyo3::prelude::*;
-use pyo3::exceptions::PyRuntimeError;
-use serde::Serialize;
-use std::fs::File;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::Duration;
+// =====================================================================
+// ARQUIVO: src/lib.rs
+// OBJETIVO: O coração pulsante escrito em Rust de extrema performance.
+// Aqui criamos a Classe que o Python vai enxergar e usar como se fosse dele.
+// =====================================================================
 
-// Submódulos locais que compõem a arquitetura de sensores deste motor FFI.
+use pyo3::prelude::*; // Importa a magia do PyO3 que permite traduzir memória do Rust para o Python
+use pyo3::exceptions::PyRuntimeError; // Para jogar erros (Exceptions) bonitas na tela do Python se algo falhar
+use serde::Serialize; // Para podermos converter os dados de Rust direto para um arquivo JSON hiper-rápido
+use std::fs::File; // Para manipular a criação e escrita de arquivos no HD
+use std::sync::{Arc, Mutex}; // Para proteger nossa Memória quando várias "Threads" (Processos) tentarem acessar ao mesmo tempo
+use std::sync::atomic::{AtomicBool, Ordering}; // Booleanos ultra rápidos à prova de falhas para comunicação entre threads
+use std::thread; // Para rodarmos a leitura de energia escondidos em segundo plano sem travar o Python
+use std::time::Duration; // Para definir pausas perfeitas (ex: 100 milissegundos)
+
+// Declaração dos sub-arquivos (módulos) do nosso projeto, onde ficam as lógicas complexas de cada peça de hardware.
 pub mod cpu;
 pub mod ram;
 pub mod gpu;
 pub mod carbon;
 pub mod permissions;
 
-/// Representação serializável da base de dados final produzida no momento da Interrupção pelo usuário.
+/// Esta "Struct" (Estrutura) funciona como um molde para a exportação do JSON final.
+/// O comando #[derive(Serialize)] diz para o Rust: "Escreva o código sozinho que converte isso pra JSON pra mim".
 #[derive(Serialize)]
 pub struct ExportData {
-    pub timestamp: u64,       // Marcação unix-time garantindo consistência cronológica
-    pub watts: f64,           // Demanda energética absoluta dividida pelao tempo ativo
-    pub total_joules: f64,    // Unidade universal capturada dos transistores físicos
-    pub co2_emissions: f64,   // Conversão termodinâmica processada em massa de carbono
-    pub estimated_fallback: bool, // Flag atestando se a energia veio por predição termodinâmica.
+    pub timestamp: u64,           // Marcação do relógio mundial (Unix Epoch)
+    pub watts: f64,               // Consumo total em Watts
+    pub hardware_joules: f64,     // Consumo bruto extraído direto da placa mãe
+    pub hardware_microjoules: f64,// A mesma energia bruta, mas em microjoules (Joules * 1.000.000)
+    pub total_facility_joules: f64, // Consumo considerando a ineficiência do ar-condicionado do prédio (PUE)
+    pub co2_emissions: f64,       // Massa física de gás carbônico gerada
+    pub estimated_fallback: bool, // Se for True, significa que não tínhamos root/sudo e precisamos estimar matematicamente
+    pub pue_applied: f64,         // Fator PUE aplicado
+    pub intensity_source: String, // Qual foi a ponte usada? (API Direta, Proxy do Cloudflare, ou Banco Offline?)
 }
 
-/// A classe Raiz exportada para o Python. É decorada com [pyclass] o que diz ao PyO3 
-/// para mapear seus tipos de memória como se fossem ponteiros nativos C do CPython!
+/// A "Classe" Raiz exportada para o Python. A macro #[pyclass] avisa o compilador do C que
+/// essa estrutura de memória do Rust deve ser embalada em um objeto Python!
 #[pyclass]
 pub struct GravityTracker {
-    // Sensores individuais encarregados da infraestrutura de baixo nível.
+    // ----------------------------------------------------
+    // OS SENSORES
+    // ----------------------------------------------------
     pub sensor: cpu::CpuSensor,
     pub ram_sensor: ram::RamSensor,
     pub gpu_sensor: gpu::GpuSensor,
     
-    // Auxiliar base de tempo limpa do Rust pra cronometragem de segundos brutos (não corrompe com falhas de CPU clock).
-    pub start_time: Option<std::time::Instant>,
+    // ----------------------------------------------------
+    // CONTROLES DE TEMPO E ESTADO
+    // ----------------------------------------------------
+    pub start_time: Option<std::time::Instant>, // Cronômetro de altíssima precisão
     
-    // O Coração da Threading Segura: Arc(Ponteiro Atômico) -> Mutex(Cadeado de Memória) -> Float
-    // Evita o desastre chamado "Race Condition" se o Tracker Python tentar puxar um Print no mesmíssimo momento 
-    // em que a Background Thread do Rust estiver somando o Delta do Módulo RAPL nela.
+    // O Coração da Threading Segura: Arc(Ponteiro Inteligente) -> Mutex(Cadeado de Memória) -> f64 (Número decimal)
+    // O Mutex impede o desastre chamado "Race Condition". Imagine duas pessoas tentando editar o mesmo
+    // arquivo de texto ao mesmo tempo: um apaga o trabalho do outro. O Mutex cria uma "fila" instantânea.
     pub total_joules_accumulated: Arc<Mutex<f64>>,
     
-    // Flag Volátil thread-safe para informar silenciosamente (sem locks de IO) à thread operante se ela deve se matar.
+    // Boolean atômico que serve de botão liga/desliga para a Thread secreta.
     pub is_running: Arc<AtomicBool>,
     
-    // Vetor que age como Memória de Longo Prazo do "Python Context Manager". Armazena os blocos com sufixos _start ou _end!
+    // Vetor (Lista) que guarda o nome de cada passo e a energia gasta no momento exato (o famoso _start e _end)
     pub checkpoints: Vec<(String, f64)>,
 
-    // Flag de saúde informando se o monitoramento precisou cair para o Anti-Crash Guarantee (Estimativa por CPU load)
+    // Aviso permanente caso a gente caia na estimação (sem privilégios do Linux)
     pub estimated_fallback: Arc<AtomicBool>,
+
+    // ----------------------------------------------------
+    // METADADOS DO AMBIENTE
+    // ----------------------------------------------------
+    pub pue: f64,
+    pub carbon_intensity: Option<f64>,
+    pub carbon_intensity_source: Option<String>,
 }
 
+// O bloco #[pymethods] significa: Todas as funções aqui dentro podem ser chamadas pelo Python!
 #[pymethods]
 impl GravityTracker {
-    /// O método Construtor único (Cross-platform) mapeado para `gravity_monitor.GravityTracker()` no frontend.
+    
+    /// O Construtor: Chamado quando o Python faz `tracker = gravity_monitor.GravityTracker()`
     #[new]
-    pub fn new() -> Self {
+    #[pyo3(signature = (pue=None, carbon_intensity=None, carbon_intensity_source=None))]
+    pub fn new(pue: Option<f64>, carbon_intensity: Option<f64>, carbon_intensity_source: Option<String>) -> Self {
+        // Se estivermos compilando no Windows, chama uma função especial que tenta abrir comunicação com drivers
         #[cfg(target_os = "windows")]
         permissions::SystemCapabilities::check_windows_drivers();
 
@@ -65,45 +90,45 @@ impl GravityTracker {
             ram_sensor: ram::RamSensor::new(None),
             gpu_sensor: gpu::GpuSensor::new(None),
             start_time: None,
+            // Mutex começa trancando o número "0.0" dentro dele
             total_joules_accumulated: Arc::new(Mutex::new(0.0)),
             is_running: Arc::new(AtomicBool::new(false)),
             checkpoints: Vec::new(),
             estimated_fallback: Arc::new(AtomicBool::new(false)),
+            pue: pue.unwrap_or(1.0), // Se o Python mandou Vazio (None), vira 1.0
+            carbon_intensity,
+            carbon_intensity_source,
         }
     }
 
+    // Setters que permitem o Python injetar configurações de emergência/override diretamente na memória do Rust
     #[setter]
-    pub fn set_cpu_tdp(&mut self, value: Option<f64>) {
-        self.sensor.manual_override_tdp = value;
-    }
+    pub fn set_cpu_tdp(&mut self, value: Option<f64>) { self.sensor.manual_override_tdp = value; }
 
     #[setter]
-    pub fn set_gpu_wattage(&mut self, value: Option<f64>) {
-        self.gpu_sensor.manual_override_power = value;
-    }
+    pub fn set_gpu_wattage(&mut self, value: Option<f64>) { self.gpu_sensor.manual_override_power = value; }
 
     #[setter]
-    pub fn set_ram_capacity(&mut self, value: Option<f64>) {
-        self.ram_sensor.manual_override_capacity = value;
-    }
+    pub fn set_ram_capacity(&mut self, value: Option<f64>) { self.ram_sensor.manual_override_capacity = value; }
 
-    /// Devolve ao ambiente externo de forma assíncrona se a varredura primária conseguiu dar 'Bind' em GPUs locais.
+    /// Retorna pro Python `True` ou `False` se encontrou fisicamente uma placa da NVIDIA na máquina.
     pub fn has_gpu(&self) -> PyResult<bool> {
         Ok(self.gpu_sensor.has_gpu)
     }
 
-    /// O Famoso Inicializador. Destrava e delega toda a computação à Threading Limpa do Sistema Operacional puro (Agora Cross-Platform).
+    /// O INICIALIZADOR: Onde a Thread secreta de 100ms é criada!
     pub fn start(&mut self) -> PyResult<()> {
         if self.is_running.load(Ordering::SeqCst) {
             return Err(PyRuntimeError::new_err("O monitoramento já está em andamento."));
         }
 
-        // Zera contadores na fita do tempo oficial (Milissegundo Zero)
+        // Bate o cronômetro do Ponto Zero e liga as Flags
         self.start_time = Some(std::time::Instant::now());
         self.is_running.store(true, Ordering::SeqCst);
         *self.total_joules_accumulated.lock().unwrap() = 0.0;
 
-        // Clone das referências seguras `Arc` permitindo que a Thread capture-as pra sempre até o .stop() sem quebrar o ownership do Rust
+        // O Rust obriga que a Thread paralela receba "Clones" das referências de memória. 
+        // Ele não deixa uma Thread roubar o original e depois a Thread Principal morrer e deixar lixo pra trás.
         let cpu_sensor_clone = self.sensor.clone();
         let ram_sensor_clone = self.ram_sensor.clone();
         let gpu_sensor_clone = self.gpu_sensor.clone();
@@ -111,16 +136,18 @@ impl GravityTracker {
         let acc_clone = self.total_joules_accumulated.clone();
         let fallback_clone = self.estimated_fallback.clone();
 
-        // Extrai a Medição T0 Pura fora da thread. Aborda o "Anti-Crash Guarantee" do treinamento.
+        // Leitura Zero (Antes de começar o Loop): Tenta ler a energia bruta que estava rolando no PC antes do script.
         let last_cpu = match cpu_sensor_clone.read_joules() {
-            Ok(v) => v,
+            Ok(v) => v, // Se leu os registradores do Linux com sucesso, devolve o valor.
             Err(e) => {
+                // Se deu Permissão Negada (falta de Sudo), avisa o Python enviando um Warning amarelo na tela do cara!
                 Python::with_gil(|py| {
                     if let Ok(warnings) = py.import_bound("warnings") {
                         let msg = format!("Falha de Hardware - Ativando Fallback Anti-Crash.\nMotivo: {}", e);
                         let _ = warnings.call_method1("warn", (msg, py.get_type_bound::<pyo3::exceptions::PyRuntimeWarning>()));
                     }
                 });
+                // Ativa permanentemente o selo de simulação matemática (Fallback)
                 fallback_clone.store(true, Ordering::SeqCst);
                 0.0
             }
@@ -129,31 +156,36 @@ impl GravityTracker {
         let mut last_ram = ram_sensor_clone.read_joules().unwrap_or(0.0);
         let mut last_gpu = gpu_sensor_clone.read_joules().unwrap_or(0.0);
 
-        // Dispara a Main Background Thread (completamente imune a lag e sleep de Python)
+        // NASCIMENTO DA THREAD DE BACKGROUND
+        // Essa thread roda diretamente no Processador (via C/Rust), escapando de toda a lentidão e bloqueio do Python (GIL).
         thread::spawn(move || {
+            // Enquanto o botão de power estiver ligado (True)...
             while is_running_clone.load(Ordering::SeqCst) {
-                // Ciclo Perfeito de 100ms exigido à risca para garantir precisão atômica dos Deltas
+                
+                // Dorme estritamente por 100 milissegundos.
                 thread::sleep(Duration::from_millis(100));
 
+                // Acorda e bate fotos instantâneas do consumo atual do PC
                 let current_cpu = cpu_sensor_clone.read_joules().unwrap_or(last_cpu_mut);
                 let current_ram = ram_sensor_clone.read_joules().unwrap_or(last_ram);
                 let current_gpu = gpu_sensor_clone.read_joules().unwrap_or(last_gpu);
 
-                // Deduzir Carga Integral Gasta! (Quantos Joules o PC sugou fisicamente nesses míseros 100ms de vida?)
+                // Deduzir o Gasto Físico: (Consumo Agora - Consumo da leitura passada = A Energia Gasta nesses últimos 100ms)
                 let mut delta_cpu = current_cpu - last_cpu_mut;
                 let mut delta_ram = current_ram - last_ram;
                 let mut delta_gpu = current_gpu - last_gpu;
                 
-                // Tratar "Reset" de Kernel / Spikes Sujos que acontecem se o PC entrar em suspensão ou a bateria falhar
+                // Previne valores negativos (Ex: a placa de vídeo reiniciou a fita de contador no nível do Kernel)
                 if delta_cpu < 0.0 { delta_cpu = 0.0; }
                 if delta_ram < 0.0 { delta_ram = 0.0; }
                 if delta_gpu < 0.0 { delta_gpu = 0.0; }
 
+                // Atualiza a fita do tempo pra próxima passada daqui a 100ms
                 last_cpu_mut = current_cpu;
                 last_ram = current_ram;
                 last_gpu = current_gpu;
 
-                // Salva atômicamente (Lock global no mutex com soma absoluta e rapida desockagem)
+                // Destranca o Cadeado do Cofre (Mutex), adiciona a nossa energia no montante geral, e tranca na mesma hora!
                 let mut acc = acc_clone.lock().unwrap();
                 *acc += delta_cpu + delta_ram + delta_gpu;
             }
@@ -164,24 +196,26 @@ impl GravityTracker {
     }
 
 
-    /// O Termo de Segurança de Finalização.
+    /// Desliga o monitoramento seguro e mata a Thread paralela
     pub fn stop(&mut self) -> PyResult<()> {
-        // Envia o pulso de morte pra flag atômica para o laço while fechar sem violência.
+        // Envia Falso pro Loop. Na próxima vez que o Loop acordar, ele morre naturalmente.
         self.is_running.store(false, Ordering::SeqCst);
         
-        // Graceful shutdown: adiciona um microdelay (150ms > 100ms) forçando a thread a conseguir depositar sua ultima gota do Mutex!
+        // Espera 150ms. Por que 150? Porque o Loop acorda de 100 em 100ms.
+        // Assim temos 100% de certeza que demos tempo pra ele terminar o cálculo e depositar a última conta no Mutex.
         thread::sleep(Duration::from_millis(150));
         println!("Monitoramento em background encerrado.");
         Ok(())
     }
 
-    /// API de requisição externa em tempo real para os Watts (Deltas puros divididos por Timeline Secs).
+    /// Devolve para o Python (mesmo com o código rodando em tempo real) a Potência Média em Watts.
     pub fn get_power(&self) -> PyResult<f64> {
         match self.start_time {
             Some(time) => {
                 let delta_seconds = time.elapsed().as_secs_f64();
                 let acc = *self.total_joules_accumulated.lock().unwrap();
                 if delta_seconds > 0.0 {
+                    // P=E/T (Potência(W) = Energia(J) divido pelo Tempo(s))
                     Ok(acc / delta_seconds)
                 } else {
                     Ok(0.0)
@@ -191,52 +225,60 @@ impl GravityTracker {
         }
     }
 
-    /// API Criativa e Conscientizacional para Regionalização Local das métricas climáticas.
+    /// Converte a brincadeira em impactos visuais do Brasil (Salinópolis/Praia)
     pub fn get_local_impact(&self) -> PyResult<String> {
         let acc = *self.total_joules_accumulated.lock().unwrap();
         Ok(carbon::get_salinas_equivalence(acc))
     }
 
-    /// Mapeia o conversor físico de Poluição Equivalente em cima das Normativas de Intensidade Regionais do Brasil/Outros Países
+    /// Calcula a pegada térmica exata combinando a ineficiência (PUE) e multiplicando pela sujeira da sua Rede Elétrica.
     pub fn get_emissions(&self, intensity: f64) -> PyResult<f64> {
         match self.start_time {
             Some(_) => {
                 let acc = *self.total_joules_accumulated.lock().unwrap();
-                Ok(carbon::calculate_emissions(acc, intensity))
+                let facility_joules = acc * self.pue;
+                // Usa a intensidade ao vivo do Maps/Proxy, se não achou, usa o que o Python mandou na unha
+                let actual_intensity = self.carbon_intensity.unwrap_or(intensity);
+                Ok(carbon::calculate_emissions(facility_joules, actual_intensity))
             },
             None => Err(PyRuntimeError::new_err("O monitoramento ainda não foi iniciado. Chame o método start() primeiro.")),
         }
     }
 
-    /// Injeta Ativamente o Marcador do Bloco "Scope" ao Array global de Checkpoints para posterior análise final de Perfilagem (Profiling)
+    /// O Famoso sistema de "Etiquetas". O Python diz "Oxe, marque aqui que eu to no Passo X".
+    /// O Rust pega o nível de energia do Cofre naquele EXATO MILISSEGUNDO e anota num caderninho (Vetor).
     pub fn mark_step(&mut self, step_name: &str) {
         let current_joules = *self.total_joules_accumulated.lock().unwrap();
         self.checkpoints.push((step_name.to_string(), current_joules));
     }
 
-    /// Retorna um Dicionário PyO3 Multidimensional Analisando Perfil Integral.
+    /// Ao final do treinamento, o Python chama o `get_report`.
+    /// Aqui o Rust faz uma conta pesada transformando as Etiquetas Start/End numa fatia perfeita de Bolo percentual.
     pub fn get_report(&self, intensity: f64) -> PyResult<std::collections::HashMap<String, std::collections::HashMap<String, f64>>> {
-        // Aloca os Buffers Hash Maps do Rust que o PyO3 vai traduzir em `dict()` mágicos.
         let mut report = std::collections::HashMap::new();
         let mut starts = std::collections::HashMap::new();
         let total_consumed = *self.total_joules_accumulated.lock().unwrap();
 
-        // O Parser Cruza arrays de [str, f64]: Busca matches cruzados de `_start` e `_end`.
         for (name, joules) in &self.checkpoints {
             if name.ends_with("_start") {
+                // Remove o sufíxo "_start" e guarda o nome (Ex: treinamento_ia_start -> treinamento_ia)
                 let base_name = name.trim_end_matches("_start");
                 starts.insert(base_name.to_string(), *joules);
             } else if name.ends_with("_end") {
                 let base_name = name.trim_end_matches("_end");
-                // Custo Absoluto Exato: Subtração da Linha do Tempo Start em relação a Linha de Chegada End.
+                // Se a gente achar a Etiqueta Start daquele nome... 
                 if let Some(start_joules) = starts.get(base_name) {
+                    // Subtrai: (Total do Fim) - (Total que tava no Começo) = Energia pura consumida só nessa fatia
                     let cost = joules - start_joules;
+                    let facility_cost = cost * self.pue;
+                    // Regra de três básica pra descobrir se essa fatia usou 10% ou 80% de todo o consumo geral
                     let percentage = if total_consumed > 0.0 { (cost / total_consumed) * 100.0 } else { 0.0 };
-                    let co2 = carbon::calculate_emissions(cost, intensity);
+                    let actual_intensity = self.carbon_intensity.unwrap_or(intensity);
+                    let co2 = carbon::calculate_emissions(facility_cost, actual_intensity);
                     
-                    // Empacota toda info numa subpasta do dicionário por nome
                     let mut data = std::collections::HashMap::new();
-                    data.insert("joules".to_string(), cost);
+                    data.insert("hardware_joules".to_string(), cost);
+                    data.insert("total_facility_joules".to_string(), facility_cost);
                     data.insert("percentage".to_string(), percentage);
                     data.insert("co2_equivalent".to_string(), co2);
                     
@@ -244,10 +286,11 @@ impl GravityTracker {
                 }
             }
         }
-        Ok(report)
+        Ok(report) // Retorna o Dicionário gigantesco e o PyO3 magicamente converte num "dict" pro Python
     }
 
-    /// Instanciador Nativo mágico pra FFI `tracker.scope('passo')`. Sequestra o próprio PyNode referencial (`slf`).
+    /// O `scope` cria um objeto secundário chamado `TrackerScope`.
+    /// É isso que permite o comando lindo `with tracker.scope("treinar_modelo"):` existir no Python!
     pub fn scope(slf: Py<Self>, step_name: String) -> PyResult<TrackerScope> {
         Ok(TrackerScope {
             tracker: slf.clone(),
@@ -255,7 +298,7 @@ impl GravityTracker {
         })
     }
 
-    /// Persiste silenciosamente no disco local o arquivo JSON em blocos assícronos para leitura analítica.
+    /// Escreve um JSON no HD em altíssima velocidade pulando as barreiras do Python.
     pub fn export_json(&self, filename: &str, intensity: f64) -> PyResult<()> {
         match self.start_time {
             Some(time) => {
@@ -263,22 +306,29 @@ impl GravityTracker {
                 let acc = *self.total_joules_accumulated.lock().unwrap();
                 
                 let watts = if delta_seconds > 0.0 { acc / delta_seconds } else { 0.0 };
-                let co2 = carbon::calculate_emissions(acc, intensity);
+                let facility_joules = acc * self.pue;
+                let actual_intensity = self.carbon_intensity.unwrap_or(intensity);
+                let co2 = carbon::calculate_emissions(facility_joules, actual_intensity);
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
 
+                // Monta a caixa (Struct) que criamos no começo do arquivo
                 let data = ExportData {
                     timestamp,
                     watts,
-                    total_joules: acc,
+                    hardware_joules: acc,
+                    hardware_microjoules: acc * 1_000_000.0,
+                    total_facility_joules: facility_joules,
                     co2_emissions: co2,
                     estimated_fallback: self.estimated_fallback.load(Ordering::SeqCst),
+                    pue_applied: self.pue,
+                    intensity_source: self.carbon_intensity_source.clone().unwrap_or_else(|| "fallback_argument".to_string()),
                 };
 
                 let file = File::create(filename).map_err(|e| PyRuntimeError::new_err(format!("Erro ao criar arquivo: {}", e)))?;
-                // O Rust embute Serializadores de JSON nativos mais velozes e mais seguros que o modulo `json` do root Python!
+                // Empurra o JSON diretamente pro arquivo de forma linda (`pretty`)
                 serde_json::to_writer_pretty(file, &data).map_err(|e| PyRuntimeError::new_err(format!("Erro ao serializar JSON: {}", e)))?;
                 Ok(())
             }
@@ -287,7 +337,7 @@ impl GravityTracker {
     }
 }
 
-/// A Ponte ContextManager para o Python
+/// A Segunda Classe do Rust: Representa o escopo individual `with tracker.scope(...)` do Python
 #[pyclass]
 pub struct TrackerScope {
     tracker: Py<GravityTracker>,
@@ -296,14 +346,19 @@ pub struct TrackerScope {
 
 #[pymethods]
 impl TrackerScope {
-    /// O Gatilho de Ativação do Bloco (Chamado por C baixo-nivel toda vez que uma sintaxe de IA `with tracker.scope:` abre chave)
+    /// A Magia Negra (Dunder Method __enter__). 
+    /// O Python chama isso sozinho quando entra na palavra "with".
+    /// Nós imediatamente mandamos o Rust marcar a "Etiqueta Start".
     fn __enter__(&self, py: Python<'_>) -> PyResult<()> {
         let mut tracker = self.tracker.borrow_mut(py);
         tracker.mark_step(&format!("{}_start", self.step_name));
         Ok(())
     }
 
-    /// O Destrutor Natural. Tranca o Timestamp Final mesmo que houvesse uma interrupção inesperada pelo Python!
+    /// O Destrutor Natural (__exit__). 
+    /// O Python chama isso sozinho quando a indentação do "with" acaba, ou até MESMO SE O SCRIPT DER ERRO!
+    /// Isso é genial, porque nós sempre marcamos o _end mesmo se o modelo de IA der crash na memória,
+    /// garantindo que o desenvolvedor tenha a energia gasta até o segundo antes do Kernel Panic.
     #[allow(unused_variables)]
     fn __exit__(
         &self,
@@ -314,11 +369,13 @@ impl TrackerScope {
     ) -> PyResult<bool> {
         let mut tracker = self.tracker.borrow_mut(py);
         tracker.mark_step(&format!("{}_end", self.step_name));
-        Ok(false) // Retornar False garante não mascarar/silenciar Crashes críticos pra Aplicação do Dev acima.
+        Ok(false) // Retornar 'false' significa "Pode prosseguir com o Erro pro usuário, não vou calar a Exception".
     }
 }
 
-// O Bootloader Principal FFI do C Extensions. Exporta oficialmente tudo dentro de `gravity_monitor.so`.
+/// O BOOTLOADER. O Carregador principal do módulo C Extension.
+/// Aqui dizemos pra biblioteca CPython do C++ que nosso nome oficial é `gravity_monitor` 
+/// e exportamos as Classes que criamos pro ecossistema Python nativamente!
 #[pymodule]
 fn gravity_monitor(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GravityTracker>()?;

@@ -19,3 +19,5 @@ env/
 # Resultados locais gerados
 resultado.json
 .venv/
+.env
+resultado.*.json
